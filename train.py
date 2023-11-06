@@ -87,6 +87,20 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         gt_image = viewpoint_cam.original_image.cuda()
         Ll1 = l1_loss(image, gt_image)
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
+        # if viewpoint_cam.original_depth is not None:
+        #     if iteration==first_iter:
+        #         print("!!!!!! Using depth loss !!!!!!!!")
+        #     depth = render_pkg["depth"][0]
+        #     depth_mask = (depth>0)#render_pkg["acc"][0]
+        #     # if viewpoint_cam.original_mask is None:
+        #     #     gt_maskeddepth = viewpoint_cam.original_depth.cuda() * mask
+        #     # else:
+        #     #     gt_maskeddepth = (viewpoint_cam.original_depth * viewpoint_cam.original_mask).cuda() 
+        #     import pdb; pdb.set_trace()
+        #     gt_maskeddepth = (viewpoint_cam.original_depth * depth_mask).cuda()
+        #     # if iteration==5000:
+        #     #     import pdb; pdb.set_trace()
+        #     loss += l2_loss(gt_maskeddepth, depth*depth_mask) * 0.1
         loss.backward()
 
         iter_end.record()
@@ -95,7 +109,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # Progress bar
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             if iteration % 10 == 0:
-                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}"})
+                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}", "#pts": gaussians._xyz.shape[0]})
                 progress_bar.update(10)
             if iteration == opt.iterations:
                 progress_bar.close()
@@ -204,7 +218,6 @@ if __name__ == "__main__":
     parser.add_argument("--start_checkpoint", type=str, default = None)
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
-    
     print("Optimizing " + args.model_path)
 
     # Initialize system state (RNG)
