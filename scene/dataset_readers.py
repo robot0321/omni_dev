@@ -22,6 +22,7 @@ from pathlib import Path
 from plyfile import PlyData, PlyElement
 from utils.sh_utils import SH2RGB
 from scene.gaussian_model import BasicPointCloud
+import imageio
 
 class CameraInfo(NamedTuple):
     uid: int
@@ -39,6 +40,7 @@ class SceneInfo(NamedTuple):
     point_cloud: BasicPointCloud
     train_cameras: list
     test_cameras: list
+    preset_cameras: list
     nerf_normalization: dict
     ply_path: str
 
@@ -107,9 +109,10 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
 def fetchPly(path):
     plydata = PlyData.read(path)
     vertices = plydata['vertex']
-    positions = np.vstack([vertices['x'], vertices['y'], vertices['z']]).T               if 'x' in vertices else None
-    colors = np.vstack([vertices['red'], vertices['green'], vertices['blue']]).T / 255.0 if 'red' in vertices else None
-    normals = np.vstack([vertices['nx'], vertices['ny'], vertices['nz']]).T              if 'nx' in vertices else None
+    idx = np.random.choice(len(vertices['x']),size=(min(len(vertices['x']), 100_000),),replace=False)
+    positions = np.vstack([vertices['x'][idx], vertices['y'][idx], vertices['z'][idx]]).T               if 'x' in vertices else None
+    colors = np.vstack([vertices['red'][idx], vertices['green'][idx], vertices['blue'][idx]]).T / 255.0 if 'red' in vertices else None
+    normals = np.vstack([vertices['nx'][idx], vertices['ny'][idx], vertices['nz'][idx]]).T              if 'nx' in vertices else None
     return BasicPointCloud(points=positions, colors=colors, normals=normals)
 
 def storePly(path, xyz, rgb):
@@ -129,7 +132,7 @@ def storePly(path, xyz, rgb):
     ply_data = PlyData([vertex_element])
     ply_data.write(path)
 
-def readColmapSceneInfo(path, images, eval, llffhold=8):
+def readColmapSceneInfo(path, images, eval, preset=None, llffhold=8):
     try:
         cameras_extrinsic_file = os.path.join(path, "sparse/0", "images.bin")
         cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.bin")
@@ -146,8 +149,10 @@ def readColmapSceneInfo(path, images, eval, llffhold=8):
     cam_infos = sorted(cam_infos_unsorted.copy(), key = lambda x : x.image_name)
 
     if eval:
-        train_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold != 0]
-        test_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold == 0]
+        # train_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold != 0]
+        # test_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold == 0]
+        train_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % 5 == 2 or idx % 5 == 0]
+        test_cam_infos  = [c for idx, c in enumerate(cam_infos) if not (idx % 5 == 2 or idx % 5 == 0)]
     else:
         train_cam_infos = cam_infos
         test_cam_infos = []
@@ -169,9 +174,15 @@ def readColmapSceneInfo(path, images, eval, llffhold=8):
     except:
         pcd = None
 
+    if preset:
+        preset_cam_infos = readCamerasFromPreset('/home/chung/workspace/gaussian-splatting/poses_supplementary', f"{preset}.json")
+    else:
+        preset_cam_infos = None
+
     scene_info = SceneInfo(point_cloud=pcd,
                            train_cameras=train_cam_infos,
                            test_cameras=test_cam_infos,
+                           preset_cameras=preset_cam_infos,
                            nerf_normalization=nerf_normalization,
                            ply_path=ply_path)
     return scene_info
@@ -200,7 +211,17 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
             image_path = os.path.join(path, cam_name)
             image_name = Path(cam_name).stem
             image = Image.open(image_path)
-
+            
+            # if os.path.exists(os.path.join(path, frame["file_path"].replace("/train/", "/depths_train/")+'.npy')):
+            #     depth = np.load(os.path.join(path, frame["file_path"].replace("/train/", "/depths_train/")+'.npy'))
+            #     if os.path.exists(os.path.join(path, frame["file_path"].replace("/train/", "/masks_train/")+'.png')):
+            #         mask = imageio.v3.imread(os.path.join(path, frame["file_path"].replace("/train/", "/masks_train/")+'.png'))[:,:,0]/255.
+            #     else:
+            #         mask = np.ones_like(depth)
+            #     final_depth = depth*mask
+            # else:
+            #     final_depth = None
+                
             im_data = np.array(image.convert("RGBA"))
 
             bg = np.array([1,1,1]) if white_background else np.array([0, 0, 0])
@@ -209,7 +230,7 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
             arr = norm_data[:,:,:3] * norm_data[:, :, 3:4] + bg * (1 - norm_data[:, :, 3:4])
             image = Image.fromarray(np.array(arr*255.0, dtype=np.byte), "RGB")
 
-            fovy = focal2fov(fov2focal(fovx, image.size[0]), image.size[1])
+            fovy = focal2fov(fov2focal(fovx, image.size[1]), image.size[0])
             FovY = fovy 
             FovX = fovx
 
@@ -218,11 +239,50 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
             
     return cam_infos
 
-def readNerfSyntheticInfo(path, white_background, eval, extension=".png"):
+
+def readCamerasFromPreset(path, transformsfile):
+    cam_infos = []
+
+    with open(os.path.join(path, transformsfile)) as json_file:
+        contents = json.load(json_file)
+        FOV = contents["camera_angle_x"]*1.2
+
+        frames = contents["frames"]
+        for idx, frame in enumerate(frames):
+            # NeRF 'transform_matrix' is a camera-to-world transform
+            c2w = np.array(frame["transform_matrix"])
+            # change from OpenGL/Blender camera axes (Y up, Z back) to COLMAP (Y down, Z forward)
+            c2w[:3, 1:3] *= -1
+
+            # get the world-to-camera transform and set R, T
+            w2c = np.linalg.inv(np.concatenate((c2w, np.array([0,0,0,1]).reshape(1,4)), axis=0))
+            R = np.transpose(w2c[:3,:3])  # R is stored transposed due to 'glm' in CUDA code
+            T = w2c[:3, 3]
+            # R = c2w[:3,:3]
+            # T = - np.transpose(R).dot(c2w[:3,3])
+
+            image = Image.fromarray(np.zeros((512,512)), "RGB")
+            FovY = focal2fov(fov2focal(FOV, 512), image.size[0]) 
+            FovX = focal2fov(fov2focal(FOV, 512), image.size[1]) 
+            # FovX, FovY = contents["camera_angle_x"], contents["camera_angle_x"]
+
+            cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
+                            image_path='None', image_name='None', width=image.size[1], height=image.size[0]))
+            
+    return cam_infos
+
+
+
+def readNerfSyntheticInfo(path, white_background, eval, preset=None, extension=".png"):
     print("Reading Training Transforms")
     train_cam_infos = readCamerasFromTransforms(path, "transforms_train.json", white_background, extension)
     print("Reading Test Transforms")
     test_cam_infos = readCamerasFromTransforms(path, "transforms_test.json", white_background, extension)
+    
+    if preset:
+        preset_cam_infos = readCamerasFromPreset('/home/chung/workspace/gaussian-splatting/poses_supplementary', f"{preset}.json")
+    else:
+        preset_cam_infos = None
     
     if not eval:
         train_cam_infos.extend(test_cam_infos)
@@ -247,10 +307,11 @@ def readNerfSyntheticInfo(path, white_background, eval, extension=".png"):
         pcd = fetchPly(ply_path)
     except:
         pcd = None
-
+    
     scene_info = SceneInfo(point_cloud=pcd,
                            train_cameras=train_cam_infos,
                            test_cameras=test_cam_infos,
+                           preset_cameras=preset_cam_infos,
                            nerf_normalization=nerf_normalization,
                            ply_path=ply_path)
     return scene_info
