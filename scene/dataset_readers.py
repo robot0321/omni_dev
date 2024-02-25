@@ -8,9 +8,10 @@
 #
 # For inquiries contact  george.drettakis@inria.fr
 #
-
+import torch
 import os
 import sys
+import glob
 from PIL import Image
 from typing import NamedTuple
 from scene.colmap_loader import read_extrinsics_text, read_intrinsics_text, qvec2rotmat, \
@@ -23,6 +24,9 @@ from plyfile import PlyData, PlyElement
 from utils.sh_utils import SH2RGB
 from scene.gaussian_model import BasicPointCloud
 import imageio
+import matplotlib.pyplot as plt
+# from scene.hyper_camera import Camera as HyperNeRFCamera
+
 
 class CameraInfo(NamedTuple):
     uid: int
@@ -35,14 +39,89 @@ class CameraInfo(NamedTuple):
     image_name: str
     width: int
     height: int
+    time: float
 
 class SceneInfo(NamedTuple):
     point_cloud: BasicPointCloud
     train_cameras: list
     test_cameras: list
-    preset_cameras: list
+    vis_cameras: list
     nerf_normalization: dict
     ply_path: str
+    time_delta: float
+
+def normalize(v):
+    """Normalize a vector."""
+    return v / np.linalg.norm(v)
+
+
+def average_poses(poses):
+    """
+    Calculate the average pose, which is then used to center all poses
+    using @center_poses. Its computation is as follows:
+    1. Compute the center: the average of pose centers.
+    2. Compute the z axis: the normalized average z axis.
+    3. Compute axis y': the average y axis.
+    4. Compute x' = y' cross product z, then normalize it as the x axis.
+    5. Compute the y axis: z cross product x.
+
+    Note that at step 3, we cannot directly use y' as y axis since it's
+    not necessarily orthogonal to z axis. We need to pass from x to y.
+    Inputs:
+        poses: (N_images, 3, 4)
+    Outputs:
+        pose_avg: (3, 4) the average pose
+    """
+    # 1. Compute the center
+    center = poses[..., 3].mean(0)  # (3)
+
+    # 2. Compute the z axis
+    z = normalize(poses[..., 2].mean(0))  # (3)
+
+    # 3. Compute axis y' (no need to normalize as it's not the final output)
+    y_ = poses[..., 1].mean(0)  # (3)
+
+    # 4. Compute the x axis
+    x = normalize(np.cross(z, y_))  # (3)
+
+    # 5. Compute the y axis (as z and x are normalized, y is already of norm 1)
+    y = np.cross(x, z)  # (3)
+
+    pose_avg = np.stack([x, y, z, center], 1)  # (3, 4)
+
+    return pose_avg
+
+
+def center_poses(poses, blender2opencv):
+    """
+    Center the poses so that we can use NDC.
+    See https://github.com/bmild/nerf/issues/34
+    Inputs:
+        poses: (N_images, 3, 4)
+    Outputs:
+        poses_centered: (N_images, 3, 4) the centered poses
+        pose_avg: (3, 4) the average pose
+    """
+    poses = poses @ blender2opencv
+    pose_avg = average_poses(poses)  # (3, 4)
+    pose_avg_homo = np.eye(4)
+    pose_avg_homo[
+        :3
+    ] = pose_avg  # convert to homogeneous coordinate for faster computation
+    pose_avg_homo = pose_avg_homo
+    # by simply adding 0, 0, 0, 1 as the last row
+    last_row = np.tile(np.array([0, 0, 0, 1]), (len(poses), 1, 1))  # (N_images, 1, 4)
+    poses_homo = np.concatenate(
+        [poses, last_row], 1
+    )  # (N_images, 4, 4) homogeneous coordinate
+
+    poses_centered = np.linalg.inv(pose_avg_homo) @ poses_homo  # (N_images, 4, 4)
+    #     poses_centered = poses_centered  @ blender2opencv
+    poses_centered = poses_centered[:, :3]  # (N_images, 3, 4)
+
+    return poses_centered, pose_avg_homo
+
+
 
 def getNerfppNorm(cam_info):
     def get_center_and_diag(cam_centers):
@@ -101,7 +180,7 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
         image = Image.open(image_path)
 
         cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
-                              image_path=image_path, image_name=image_name, width=width, height=height)
+                              image_path=image_path, image_name=image_name, width=width, height=height, time=0)
         cam_infos.append(cam_info)
     sys.stdout.write('\n')
     return cam_infos
@@ -109,22 +188,43 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
 def fetchPly(path):
     plydata = PlyData.read(path)
     vertices = plydata['vertex']
-    idx = np.random.choice(len(vertices['x']),size=(min(len(vertices['x']), 100_000),),replace=False)
-    positions = np.vstack([vertices['x'][idx], vertices['y'][idx], vertices['z'][idx]]).T               if 'x' in vertices else None
-    colors = np.vstack([vertices['red'][idx], vertices['green'][idx], vertices['blue'][idx]]).T / 255.0 if 'red' in vertices else None
-    normals = np.vstack([vertices['nx'][idx], vertices['ny'][idx], vertices['nz'][idx]]).T              if 'nx' in vertices else None
+
+    colors = np.vstack([vertices['red'], vertices['green'], vertices['blue']]).T / 255.0
+    normals = np.vstack([vertices['nx'], vertices['ny'], vertices['nz']]).T
+    # x_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("x")]
+    # y_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("y")]
+    # z_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("z")]
+    # x_names = sorted(x_names, key = lambda x: int(x.replace('x', '')))
+    # y_names = sorted(y_names, key = lambda y: int(y.replace('y', '')))
+    # z_names = sorted(z_names, key = lambda z: int(z.replace('z', '')))
+    # assert len(x_names) == len(y_names) == len(z_names)
+    # x = np.zeros((colors.shape[0], len(x_names)))
+    # y = np.zeros((colors.shape[0], len(y_names)))
+    # z = np.zeros((colors.shape[0], len(z_names)))
+    # for idx, attr_name in enumerate(x_names):
+    #     x[:, idx] = np.asarray(plydata.elements[0][attr_name])
+    # for idx, attr_name in enumerate(y_names):
+    #     y[:, idx] = np.asarray(plydata.elements[0][attr_name])
+    # for idx, attr_name in enumerate(z_names):
+    #     z[:, idx] = np.asarray(plydata.elements[0][attr_name])
+    positions = np.vstack([vertices['x'], vertices['y'], vertices['z']]).T
+    # positions = np.stack([x, y, z], axis=-1)
+    # assert len(positions.shape) == 3
+    # assert positions.shape[-1] == 3
     return BasicPointCloud(points=positions, colors=colors, normals=normals)
 
 def storePly(path, xyz, rgb):
     # Define the dtype for the structured array
-    dtype = [('x', 'f4'), ('y', 'f4'), ('z', 'f4'),
-            ('nx', 'f4'), ('ny', 'f4'), ('nz', 'f4'),
+    dtype = []
+    # for t in range(xyz.shape[1]):
+    dtype.extend([(f'x', 'f4'), (f'y', 'f4'), (f'z', 'f4')])
+    dtype = dtype + [('nx', 'f4'), ('ny', 'f4'), ('nz', 'f4'),
             ('red', 'u1'), ('green', 'u1'), ('blue', 'u1')]
     
     normals = np.zeros_like(xyz)
 
     elements = np.empty(xyz.shape[0], dtype=dtype)
-    attributes = np.concatenate((xyz, normals, rgb), axis=1)
+    attributes = np.concatenate((xyz.reshape(xyz.shape[0], -1), normals, rgb), axis=1)
     elements[:] = list(map(tuple, attributes))
 
     # Create the PlyData object and write to file
@@ -147,19 +247,17 @@ def readColmapSceneInfo(path, images, eval, preset=None, llffhold=8):
     reading_dir = "images" if images == None else images
     cam_infos_unsorted = readColmapCameras(cam_extrinsics=cam_extrinsics, cam_intrinsics=cam_intrinsics, images_folder=os.path.join(path, reading_dir))
     cam_infos = sorted(cam_infos_unsorted.copy(), key = lambda x : x.image_name)
-
+ 
     if eval:
-        # train_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold != 0]
-        # test_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold == 0]
-        train_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % 5 == 2 or idx % 5 == 0]
-        test_cam_infos  = [c for idx, c in enumerate(cam_infos) if not (idx % 5 == 2 or idx % 5 == 0)]
+        train_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold != 0]
+        test_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold == 0]
     else:
         train_cam_infos = cam_infos
         test_cam_infos = []
 
     nerf_normalization = getNerfppNorm(train_cam_infos)
 
-    ply_path = os.path.join(path, "sparse/0/points3D.ply")
+    ply_path = os.path.join(path, "sparse/0/points3D_ours.ply")
     bin_path = os.path.join(path, "sparse/0/points3D.bin")
     txt_path = os.path.join(path, "sparse/0/points3D.txt")
     if not os.path.exists(ply_path):
@@ -168,23 +266,20 @@ def readColmapSceneInfo(path, images, eval, preset=None, llffhold=8):
             xyz, rgb, _ = read_points3D_binary(bin_path)
         except:
             xyz, rgb, _ = read_points3D_text(txt_path)
+        # xyz = xyz[:, None, :]
         storePly(ply_path, xyz, rgb)
     try:
         pcd = fetchPly(ply_path)
     except:
         pcd = None
 
-    if preset:
-        preset_cam_infos = readCamerasFromPreset('/home/chung/workspace/gaussian-splatting/poses_supplementary', f"{preset}.json")
-    else:
-        preset_cam_infos = None
-
     scene_info = SceneInfo(point_cloud=pcd,
                            train_cameras=train_cam_infos,
                            test_cameras=test_cam_infos,
-                           preset_cameras=preset_cam_infos,
+                           vis_cameras=[],
                            nerf_normalization=nerf_normalization,
-                           ply_path=ply_path)
+                           ply_path=ply_path,
+                           time_delta=1)
     return scene_info
 
 def readCamerasFromTransforms(path, transformsfile, white_background, extension=".png"):
@@ -195,6 +290,13 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
         fovx = contents["camera_angle_x"]
 
         frames = contents["frames"]
+        # if 'time' in frames[0]:
+        #     times = np.array([frame['time'] for idx, frame in enumerate(frames)])
+        #     time_idx = times.argsort()
+        # else:
+        #     time_idx = [0 for f in frames]
+        # print(times)
+        # print(time_idx)
         for idx, frame in enumerate(frames):
             cam_name = os.path.join(path, frame["file_path"] + extension)
 
@@ -211,17 +313,7 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
             image_path = os.path.join(path, cam_name)
             image_name = Path(cam_name).stem
             image = Image.open(image_path)
-            
-            # if os.path.exists(os.path.join(path, frame["file_path"].replace("/train/", "/depths_train/")+'.npy')):
-            #     depth = np.load(os.path.join(path, frame["file_path"].replace("/train/", "/depths_train/")+'.npy'))
-            #     if os.path.exists(os.path.join(path, frame["file_path"].replace("/train/", "/masks_train/")+'.png')):
-            #         mask = imageio.v3.imread(os.path.join(path, frame["file_path"].replace("/train/", "/masks_train/")+'.png'))[:,:,0]/255.
-            #     else:
-            #         mask = np.ones_like(depth)
-            #     final_depth = depth*mask
-            # else:
-            #     final_depth = None
-                
+
             im_data = np.array(image.convert("RGBA"))
 
             bg = np.array([1,1,1]) if white_background else np.array([0, 0, 0])
@@ -230,93 +322,480 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
             arr = norm_data[:,:,:3] * norm_data[:, :, 3:4] + bg * (1 - norm_data[:, :, 3:4])
             image = Image.fromarray(np.array(arr*255.0, dtype=np.byte), "RGB")
 
-            fovy = focal2fov(fov2focal(fovx, image.size[1]), image.size[0])
+            fovy = focal2fov(fov2focal(fovx, image.size[0]), image.size[1])
             FovY = fovy 
             FovX = fovx
+            time = frame['time'] if 'time' in frame else 0
 
             cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
-                            image_path=image_path, image_name=image_name, width=image.size[0], height=image.size[1]))
+                                        image_path=image_path, image_name=image_name,
+                                        width=image.size[0], height=image.size[1], time=time))
             
     return cam_infos
 
 
-def readCamerasFromPreset(path, transformsfile):
+# https://github.com/albertpumarola/D-NeRF/blob/main/load_blender.py
+trans_t = lambda t : torch.Tensor([
+    [1,0,0,0],
+    [0,1,0,0],
+    [0,0,1,t],
+    [0,0,0,1]]).float()
+
+rot_phi = lambda phi : torch.Tensor([
+    [1,0,0,0],
+    [0,np.cos(phi),-np.sin(phi),0],
+    [0,np.sin(phi), np.cos(phi),0],
+    [0,0,0,1]]).float()
+
+rot_theta = lambda th : torch.Tensor([
+    [np.cos(th),0,-np.sin(th),0],
+    [0,1,0,0],
+    [np.sin(th),0, np.cos(th),0],
+    [0,0,0,1]]).float()
+
+def pose_spherical(theta, phi, radius):
+    # https://github.com/albertpumarola/D-NeRF/blob/main/load_blender.py
+    c2w = trans_t(radius)
+    c2w = rot_phi(phi/180.*np.pi) @ c2w
+    c2w = rot_theta(theta/180.*np.pi) @ c2w
+    c2w = torch.Tensor(np.array([[-1,0,0,0],[0,0,1,0],[0,1,0,0],[0,0,0,1]])) @ c2w
+    return c2w
+
+def generateCamerasFromTransforms(path, transformsfile, extension=".png"):
     cam_infos = []
+
+    # https://github.com/albertpumarola/D-NeRF/blob/main/load_blender.py
+    render_poses = torch.stack([pose_spherical(angle, -30.0, 4.0) for angle in np.linspace(-180,180,40+1)[:-1]], 0)
+    render_times = torch.linspace(0., 1., render_poses.shape[0])    
 
     with open(os.path.join(path, transformsfile)) as json_file:
         contents = json.load(json_file)
-        FOV = contents["camera_angle_x"]*1.2
+        fovx = contents["camera_angle_x"]
 
         frames = contents["frames"]
-        for idx, frame in enumerate(frames):
-            # NeRF 'transform_matrix' is a camera-to-world transform
-            c2w = np.array(frame["transform_matrix"])
-            # change from OpenGL/Blender camera axes (Y up, Z back) to COLMAP (Y down, Z forward)
-            c2w[:3, 1:3] *= -1
+    cam_name = os.path.join(path, frames[0]["file_path"] + extension)        
+    image_path = os.path.join(path, cam_name)
+    image_name = Path(cam_name).stem
+    image = Image.open(image_path)
+    width = image.size[0]
+    height = image.size[1]
 
-            # get the world-to-camera transform and set R, T
-            w2c = np.linalg.inv(np.concatenate((c2w, np.array([0,0,0,1]).reshape(1,4)), axis=0))
-            R = np.transpose(w2c[:3,:3])  # R is stored transposed due to 'glm' in CUDA code
-            T = w2c[:3, 3]
-            # R = c2w[:3,:3]
-            # T = - np.transpose(R).dot(c2w[:3,3])
+    for idx, (c2w, time) in enumerate(zip(render_poses, render_times)):
+        c2w[:3, 1:3] *= -1
 
-            image = Image.fromarray(np.zeros((512,512)), "RGB")
-            FovY = focal2fov(fov2focal(FOV, 512), image.size[0]) 
-            FovX = focal2fov(fov2focal(FOV, 512), image.size[1]) 
-            # FovX, FovY = contents["camera_angle_x"], contents["camera_angle_x"]
+        # get the world-to-camera transform and set R, T
+        w2c = np.linalg.inv(c2w)
+        R = np.transpose(w2c[:3,:3])  # R is stored transposed due to 'glm' in CUDA code
+        T = w2c[:3, 3]
 
-            cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
-                            image_path='None', image_name='None', width=image.size[1], height=image.size[0]))
+        fovy = focal2fov(fov2focal(fovx, width), height)
+        FovY = fovy 
+        FovX = fovx
+
+        cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX, 
+                                    image=None, image_path=None, image_name=None,
+                                    width=width, height=height, time=time))
             
     return cam_infos
 
-
-
-def readNerfSyntheticInfo(path, white_background, eval, preset=None, extension=".png"):
-    print("Reading Training Transforms")
-    train_cam_infos = readCamerasFromTransforms(path, "transforms_train.json", white_background, extension)
-    print("Reading Test Transforms")
-    test_cam_infos = readCamerasFromTransforms(path, "transforms_test.json", white_background, extension)
-    
-    if preset:
-        preset_cam_infos = readCamerasFromPreset('/home/chung/workspace/gaussian-splatting/poses_supplementary', f"{preset}.json")
-    else:
-        preset_cam_infos = None
-    
-    if not eval:
-        train_cam_infos.extend(test_cam_infos)
-        test_cam_infos = []
-
-    nerf_normalization = getNerfppNorm(train_cam_infos)
-
-    ply_path = os.path.join(path, "points3d.ply")
+def init_random_points(ply_path):
     if not os.path.exists(ply_path):
         # Since this data set has no colmap data, we start with random points
         num_pts = 100_000
         print(f"Generating random point cloud ({num_pts})...")
         
         # We create random points inside the bounds of the synthetic Blender scenes
+        # time_length = max([c.time for c in train_cam_infos]) + 1
+        # time_length = 2
         xyz = np.random.random((num_pts, 3)) * 2.6 - 1.3
+        # xyz = np.tile(xyz, (1, time_length, 1))
+        # xyz = np.concatenate([np.random.random((num_pts, 1, 3)) * 2.6 - 1.3, np.zeros((num_pts, 2, 3)), np.random.random((num_pts, 1, 3)) * 2.6 - 1.3, np.zeros((num_pts, 2, 3))], axis=1)
+        # xyz = np.concatenate([np.random.random((num_pts, 1, 3)) * 2.6 - 1.3, np.zeros((num_pts, 16, 3))], axis=1)
+        # xyz = np.concatenate([np.random.random((num_pts, 1, 3)) * 2.6 - 1.3, np.zeros((num_pts, 3, 3)), np.ones((num_pts, 1, 3))], axis=1)
+        # xyz = np.concatenate([np.random.random((num_pts, 1, 3)) * 2.6 - 1.3, np.zeros((num_pts, 2, 3)), np.random.random((num_pts, 1, 3)) * 2.6 - 1.3, np.zeros((num_pts, 2, 3))], axis=1)
         shs = np.random.random((num_pts, 3)) / 255.0
         pcd = BasicPointCloud(points=xyz, colors=SH2RGB(shs), normals=np.zeros((num_pts, 3)))
-
         storePly(ply_path, xyz, SH2RGB(shs) * 255)
+        
+        ###########################
+        pts = np.random.random((num_pts,3))*8-4
+        dist = np.sqrt(np.sum(np.power(pts, 2), axis=1))
+        valid_idx = np.logical_and(dist<3, dist>2)
+        pts = pts[valid_idx]
+
+        cmap1 = plt.get_cmap("Spectral_r")
+        cmap2 = plt.get_cmap("gray")
+        dist = np.sqrt(np.sum(np.power(pts, 2), axis=1)+1e-6)
+        dist_xy = np.sqrt(np.sum(np.power(pts[:,:2], 2), axis=1)+1e-6)
+        dist_xz = np.sqrt(np.sum(np.power(pts[:,[0,2]], 2), axis=1)+1e-6)
+        # lat = np.arcsin(pts[:,2] / dist)
+        # lon = np.arccos(pts[:,1] / dist_xy) * np.sign(pts[:,0])
+        lat = np.arctan2(-pts[:,1], dist_xz)
+        lon = np.arctan2(pts[:,0], pts[:,2])
+        color = (1.0*cmap1(lon/2/np.pi+0.5) + 0.0*cmap2(lat/np.pi+0.5))[:,:3]
+        # color[np.random.permutation(color.shape[0]//5)] = 0.
+        lon_idx = np.logical_and(lon>-5*np.pi/180, lon<5*np.pi/180)
+        color[lon_idx] = cmap2((lat[lon_idx]/np.pi+0.5).clip(0,1))[:,:3]
+        
+        storePly(ply_path, pts, color * 255)
+        ###########################
+        
+    # try:
+    pcd = fetchPly(ply_path)
+    # except:
+        # pcd = None
+    return pcd
+
+def readNerfSyntheticInfo(path, white_background, eval, extension=".png"):
+    print("Reading Training Transforms")
+    train_cam_infos = readCamerasFromTransforms(path, "transforms_train.json", white_background, extension)
+    print("Reading Test Transforms")
+    test_cam_infos = readCamerasFromTransforms(path, "transforms_test.json", white_background, extension)
     
-    try:
-        pcd = fetchPly(ply_path)
-    except:
-        pcd = None
-    
+    vis_cam_infos = generateCamerasFromTransforms(path, "transforms_train.json")
+
+    if not eval:
+        train_cam_infos.extend(test_cam_infos)
+        test_cam_infos = []
+
+    nerf_normalization = getNerfppNorm(train_cam_infos)
+
+    ply_path = os.path.join(path, "points3d_ours.ply")
+    pcd = init_random_points(ply_path)
+
     scene_info = SceneInfo(point_cloud=pcd,
                            train_cameras=train_cam_infos,
                            test_cameras=test_cam_infos,
-                           preset_cameras=preset_cam_infos,
+                           vis_cameras=vis_cam_infos,
                            nerf_normalization=nerf_normalization,
-                           ply_path=ply_path)
+                           ply_path=ply_path, time_delta=1/len(train_cam_infos))
     return scene_info
+
+
+def viewmatrix(z, up, pos):
+    vec2 = normalize(z)
+    vec1_avg = up
+    vec0 = normalize(np.cross(vec1_avg, vec2))
+    vec1 = normalize(np.cross(vec2, vec0))
+    m = np.eye(4)
+    m[:3] = np.stack([-vec0, vec1, vec2, pos], 1)
+    return m
+
+
+def render_path_spiral(c2w, up, rads, focal, zdelta, zrate, N_rots=2, N=120):
+    render_poses = []
+    rads = np.array(list(rads) + [1.0])
+
+    for theta in np.linspace(0.0, 2.0 * np.pi * N_rots, N + 1)[:-1]:
+        c = np.dot(
+            c2w[:3, :4],
+            np.array([np.cos(theta), -np.sin(theta), -np.sin(theta * zrate), 1.0])
+            * rads,
+        )
+        z = normalize(c - np.dot(c2w[:3, :4], np.array([0, 0, -focal, 1.0])))
+        render_poses.append(viewmatrix(z, up, c))
+    return render_poses
+
+
+
+def get_spiral(c2ws_all, near_fars, rads_scale=1.0, N_views=120):
+    """
+    Generate a set of poses using NeRF's spiral camera trajectory as validation poses.
+    """
+    # center pose
+    c2w = average_poses(c2ws_all)
+
+    # Get average pose
+    up = normalize(c2ws_all[:, :3, 1].sum(0))
+
+    # Find a reasonable "focus depth" for this dataset
+    dt = 0.75
+    close_depth, inf_depth = near_fars.min() * 0.9, near_fars.max() * 5.0
+    focal = 1.0 / ((1.0 - dt) / close_depth + dt / inf_depth)
+
+    # Get radii for spiral path
+    zdelta = near_fars.min() * 0.2
+    tt = c2ws_all[:, :3, 3]
+    rads = np.percentile(np.abs(tt), 90, 0) * rads_scale
+    render_poses = render_path_spiral(
+        c2w, up, rads, focal, zdelta, zrate=0.5, N=N_views
+    )
+    return np.stack(render_poses)
+
+
+def readDynerfSceneInfo(path, eval):
+    blender2opencv = np.eye(4)
+    downsample = 2
+
+    poses_arr = np.load(os.path.join(path, "poses_bounds.npy"))
+    poses = poses_arr[:, :-2].reshape([-1, 3, 5])  # (N_cams, 3, 5)
+    near_fars = poses_arr[:, -2:]
+    videos = glob.glob(os.path.join(path, "cam*.mp4"))
+    videos = sorted(videos)
+    assert len(videos) == poses_arr.shape[0]
+
+    H, W, focal = poses[0, :, -1]
+    focal = focal / downsample
+    poses = np.concatenate([poses[..., 1:2], -poses[..., :1], poses[..., 2:4]], -1)
+    poses, pose_avg = center_poses(
+        poses, blender2opencv
+    )  # Re-center poses so that the average is near the center.
+    
+    near_original = near_fars.min()
+    scale_factor = near_original * 0.75
+    near_fars /= (
+        scale_factor  # rescale nearest plane so that it is at z = 4/3.
+    )
+    # print(scale_factor)
+    poses[..., 3] /= scale_factor
+    
+    image_dirs = [video.replace('.mp4', '') for video in videos]
+    for imgdir in image_dirs:
+        if not os.path.exists(imgdir):
+            os.makedirs(imgdir, exist_ok=True)
+            os.system(f"ffmpeg -i {imgdir+'.mp4'} -vf fps=30 {imgdir}/%05d.png")
+
+    val_index = [0]
+    images = [sorted(glob.glob(os.path.join(d, "*.png")), key=lambda x:int(os.path.splitext(os.path.basename(x))[0]))[:300] for d in image_dirs]
+    images = [gr[0:1] for gr in images] # first frame
+    train_cam_infos = []
+    for idx, image_paths in enumerate(images):
+        if idx in val_index:
+            continue
+        p = poses[idx]
+        for image_path in image_paths:
+            image_name = os.path.basename(image_path).split(".")[0]
+            time  = float(image_name) / 300
+            image = Image.open(image_path)
+            imsize = image.size
+            image = image.resize((imsize[0]//downsample, imsize[1]//downsample))
+            uid = idx * 1000 + int(image_name)
+            pose = np.eye(4)
+            pose[:3, :] = p[:3, :]
+            R = -pose[:3, :3]
+            R[:, 0] = -R[:, 0]
+            T = -pose[:3, 3].dot(R)
+            height = image.height//downsample
+            width = image.width//downsample
+            FovY = focal2fov(focal, height)
+            FovX = focal2fov(focal, width)
+            # R = pose[:3, :3]
+            # T  = pose[:3, 3]
+
+            cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
+                                  image_path=image_path, image_name=image_name, width=width, height=height, time=time)
+            train_cam_infos.append(cam_info)
+
+    test_cam_infos = []
+    for idx, image_paths in enumerate(images):
+        if idx not in val_index:
+            continue
+        p = poses[idx]
+        for image_path in image_paths:
+            image_name = os.path.basename(image_path).split(".")[0]
+            time  = float(image_name) / 300
+            image = Image.open(image_path)
+            imsize = image.size
+            image = image.resize((imsize[0]//downsample, imsize[1]//downsample))
+            uid = idx * 1000 + int(image_name)
+            pose = np.eye(4)
+            pose[:3, :] = p[:3, :]
+            R = -pose[:3, :3]
+            R[:, 0] = -R[:, 0]
+            T = -pose[:3, 3].dot(R)
+            # R = pose[:3, :3]
+            # T  = pose[:3, 3]
+            
+            height = image.height//downsample
+            width = image.width//downsample
+            FovY = focal2fov(focal, height)
+            FovX = focal2fov(focal, width)
+
+            cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
+                                  image_path=image_path, image_name=image_name, width=width, height=height, time=time)
+            test_cam_infos.append(cam_info)
+    if not eval:
+        train_cam_infos.extend(test_cam_infos)
+        test_cam_infos = []
+
+    width, height = train_cam_infos[0].width, train_cam_infos[0].height
+    # Sample N_views poses for validation - NeRF-like camera trajectory.
+    N_views = 120
+    val_poses = get_spiral(poses, near_fars, N_views=N_views)
+    val_times = torch.linspace(0.0, 1.0, val_poses.shape[0])
+    vis_cam_infos = []
+    for idx, (pose, time) in enumerate(zip(val_poses, val_times)):
+        p = pose
+        uid = idx
+        pose = np.eye(4)
+        pose[:3, :] = p[:3, :]
+        R = -pose[:3, :3]
+        R[:, 0] = -R[:, 0]
+        T = -pose[:3, 3].dot(R)
+        # R = pose[:3, :3]
+        # T  = pose[:3, 3]
+            
+        FovY = focal2fov(focal, height)
+        FovX = focal2fov(focal, width)
+
+        cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
+                              image_path=None, image_name=None, width=width, height=height, time=time)
+        vis_cam_infos.append(cam_info)
+
+
+    nerf_normalization = getNerfppNorm(train_cam_infos)
+
+    ply_path = os.path.join(path, "points3d_ours.ply")
+    if not os.path.exists(ply_path):
+        # Since this data set has no colmap data, we start with random points
+        num_pts = 2_000
+        print(f"Generating random point cloud ({num_pts})...")
+        threshold = 3
+        xyz_max = np.array([1.5*threshold, 1.5*threshold, -0*threshold])
+        xyz_min = np.array([-1.5*threshold, -1.5*threshold, -1.5*threshold])        
+        # xyz = np.concatenate([(np.random.random((num_pts, 1, 3)))* (xyz_max-xyz_min) + xyz_min, np.zeros((num_pts, 16, 3))], axis=1) 
+        # xyz = np.concatenate([np.random.random((num_pts, 1, 3)) * 2.6 - 1.3, np.zeros((num_pts, 2, 3))], axis=1)
+        xyz = np.random.random((num_pts, 3))* (xyz_max-xyz_min) + xyz_min
+        # xyz = np.load(os.path.join(path, "xyz.npy"))
+        num_pts = xyz.shape[0]
+        
+        shs = np.random.random((num_pts, 3)) / 255.0
+        pcd = BasicPointCloud(points=xyz, colors=SH2RGB(shs), normals=np.zeros((num_pts, 3)))
+        storePly(ply_path, xyz, SH2RGB(shs) * 255)
+
+    pcd = fetchPly(ply_path)
+
+    scene_info = SceneInfo(point_cloud=pcd,
+                           train_cameras=train_cam_infos,
+                           test_cameras=test_cam_infos,
+                           vis_cameras =vis_cam_infos,
+                           nerf_normalization=nerf_normalization,
+                           ply_path=ply_path, time_delta=1/300)
+    return scene_info
+
+
+
+def readHypernerfCamera(uid, camera, image_path, time):
+    height, width = int(camera.image_shape[0]), int(camera.image_shape[1])
+    image_name = os.path.basename(image_path).split(".")[0]
+    R = camera.orientation.T
+    # T = camera.translation.T
+    T = - camera.position @ R
+    image = Image.open(image_path)    
+    FovY = focal2fov(camera.focal_length, height)
+    FovX = focal2fov(camera.focal_length, width)
+    return CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
+                      image_path=image_path, image_name=image_name, width=width, height=height, time=time)    
+
+
+def readHypernerfSceneInfo(path, eval):
+    # borrow code from https://github.com/hustvl/TiNeuVox/blob/main/lib/load_hyper.py
+    use_bg_points = False
+    with open(f'{path}/scene.json', 'r') as f:
+        scene_json = json.load(f)
+    with open(f'{path}/metadata.json', 'r') as f:
+        meta_json = json.load(f)
+    with open(f'{path}/dataset.json', 'r') as f:
+        dataset_json = json.load(f)    
+    
+    near = scene_json['near']
+    far = scene_json['far']
+    coord_scale = scene_json['scale']
+    scene_center = scene_json['center']
+    
+    all_imgs = dataset_json['ids']
+    val_ids  = dataset_json['val_ids']
+    add_cam = False
+    if len(val_ids) == 0:
+        i_train = np.array([i for i in np.arange(len(all_imgs)) if (i%4 == 0)])
+        i_test = i_train+2
+        i_test = i_test[:-1,]
+    else:
+        add_cam = True
+        train_ids = dataset_json['train_ids']
+        i_test = []
+        i_train = []
+        for i in range(len(all_imgs)):
+            id = all_imgs[i]
+            if id in val_ids:
+                i_test.append(i)
+            if id in train_ids:
+                i_train.append(i)
+
+    print('i_train',i_train)
+    print('i_test',i_test)
+    all_cams = [meta_json[i]['camera_id'] for i in all_imgs]
+    all_times = [meta_json[i]['time_id'] for i in all_imgs]
+    max_time = max(all_times)
+    all_times = [meta_json[i]['time_id']/max_time for i in all_imgs]
+    selected_time = set(all_times)
+    ratio = 0.5
+
+    all_cam_params = []
+    for im in all_imgs:
+        camera = HyperNeRFCamera.from_json(f'{path}/camera/{im}.json')
+        camera = camera.scale(ratio)
+        camera.position = camera.position - scene_center
+        camera.position = camera.position * coord_scale
+        all_cam_params.append(camera)
+
+    all_imgs = [f'{path}/rgb/{int(1/ratio)}x/{i}.png' for i in all_imgs]
+    h, w = all_cam_params[0].image_shape
+    if use_bg_points:
+        with open(f'{path}/points.npy', 'rb') as f:
+            points = np.load(f)
+        bg_points = (points - scene_center) * coord_scale
+        bg_points = torch.tensor(bg_points).float()    
+
+    train_cam_infos = [readHypernerfCamera(i, all_cam_params[i], all_imgs[i], all_times[i]) for i in i_train]
+    test_cam_infos = [readHypernerfCamera(i, all_cam_params[i], all_imgs[i], all_times[i]) for i in i_test]
+
+    vis_cam_infos = [readHypernerfCamera(i, all_cam_params[i], all_imgs[i], all_times[i]) for i in np.argsort(all_cams, kind='stable')]
+
+    if not eval:
+        train_cam_infos.extend(test_cam_infos)
+        test_cam_infos = []
+
+    nerf_normalization = getNerfppNorm(train_cam_infos)
+
+    # ply_path = os.path.join(path, "points3d_ours.ply")
+    # if not os.path.exists(ply_path):
+    #     # Since this data set has no colmap data, we start with random points
+    #     num_pts = 100_000
+    #     print(f"Generating random point cloud ({num_pts})...")
+    #     threshold = 3
+    #     xyz_max = np.array([1.5*threshold, 1.5*threshold, 1.5*threshold])
+    #     xyz_min = np.array([-1.5*threshold, -1.5*threshold, -1.5*threshold])        
+    #     xyz = np.concatenate([(np.random.random((num_pts, 1, 3)))* (xyz_max-xyz_min) + xyz_min, np.zeros((num_pts, 10, 3))], axis=1)
+
+    #     shs = np.random.random((num_pts, 3)) / 255.0
+    #     pcd = BasicPointCloud(points=xyz, colors=SH2RGB(shs), normals=np.zeros((num_pts, 3)))
+
+    #     storePly(ply_path, xyz, SH2RGB(shs) * 255)
+
+    # pcd = fetchPly(ply_path)
+
+    ply_path = os.path.join(path, "points.npy")
+    xyz = np.load(ply_path, allow_pickle=True)
+    xyz = (xyz - scene_center) * coord_scale
+    xyz = xyz.astype(np.float32)[:, None, :]
+    xyz = np.concatenate([xyz, np.zeros((xyz.shape[0], 12, 3))], axis=1)
+    shs = np.random.random((xyz.shape[0], 3)) / 255.0
+    pcd = BasicPointCloud(points=xyz, colors=SH2RGB(shs), normals=np.zeros((xyz.shape[0], 3)))   
+
+    scene_info = SceneInfo(point_cloud=pcd,
+                           train_cameras=train_cam_infos,
+                           test_cameras=test_cam_infos,
+                           vis_cameras=vis_cam_infos,
+                           nerf_normalization=nerf_normalization,
+                           ply_path=ply_path, time_delta=1/max_time)
+    return scene_info
+
+
 
 sceneLoadTypeCallbacks = {
     "Colmap": readColmapSceneInfo,
-    "Blender" : readNerfSyntheticInfo
+    "Blender" : readNerfSyntheticInfo,
+    "DyNeRF": readDynerfSceneInfo,
+    "HyperNeRF": readHypernerfSceneInfo,
 }

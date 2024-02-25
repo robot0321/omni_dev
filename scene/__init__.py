@@ -42,10 +42,14 @@ class Scene:
         self.preset_cameras = {}
 
         if os.path.exists(os.path.join(args.source_path, "sparse")):
-            scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval, preset)
+            scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval)#, preset)
         elif os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
             print("Found transforms_train.json file, assuming Blender data set!")
-            scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.eval, preset)
+            scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.eval)#, preset)
+        elif os.path.exists(os.path.join(args.source_path, "init_pt_cld.npz")):
+            scene_info = sceneLoadTypeCallbacks["CMUPanoptic"](args.source_path, args.white_background, args.eval)#, preset)
+        elif os.path.exists(os.path.join(args.source_path, "cam00.mp4")):
+            scene_info = sceneLoadTypeCallbacks["DyNeRF"](args.source_path, args.eval)
         else:
             assert False, "Could not recognize scene type!"
 

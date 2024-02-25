@@ -11,7 +11,8 @@
 
 import torch
 import math
-from depth_diff_gaussian_rasterization_min import GaussianRasterizationSettings, GaussianRasterizer
+# from depth_diff_gaussian_rasterization_min import GaussianRasterizationSettings, GaussianRasterizer
+from diff_gaussian_omni_rasterization import GaussianRasterizationSettings, GaussianRasterizer
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
 
@@ -33,17 +34,19 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
     tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
 
+    import pdb; pdb.set_trace()
+    viewmatrix = torch.eye(4, device=viewpoint_camera.world_view_transform.device) #### For debugging / MUST remove after
     raster_settings = GaussianRasterizationSettings(
-        image_height=int(viewpoint_camera.image_height),
-        image_width=int(viewpoint_camera.image_width),
+        image_height=512,#int(viewpoint_camera.image_height),
+        image_width=1024,#int(viewpoint_camera.image_width),
         tanfovx=tanfovx,
         tanfovy=tanfovy,
         bg=bg_color,
         scale_modifier=scaling_modifier,
-        viewmatrix=viewpoint_camera.world_view_transform,
+        viewmatrix=viewmatrix, #viewpoint_camera.world_view_transform,
         projmatrix=viewpoint_camera.full_proj_transform,
         sh_degree=pc.active_sh_degree,
-        campos=viewpoint_camera.camera_center,
+        campos=torch.zeros_like(viewpoint_camera.camera_center), #viewpoint_camera.camera_center,
         prefiltered=False,
         debug=pipe.debug
     )
@@ -82,7 +85,10 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         colors_precomp = override_color
 
     # Rasterize visible Gaussians to image, obtain their radii (on screen). 
-    rendered_image, radii, depth = rasterizer(
+    opacity[:]=1. #### For debugging / MUST remove after
+    scales[:]=10. #### For debugging / MUST remove after
+    
+    rendered_image, radii = rasterizer(
         means3D = means3D,
         means2D = means2D,
         shs = shs,
@@ -91,11 +97,19 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         scales = scales,
         rotations = rotations,
         cov3D_precomp = cov3D_precomp)
+        
+    from PIL import Image; import numpy as np
+    Image.fromarray((rendered_image.permute(1,2,0).detach().cpu().numpy()*255.).astype(np.uint8)).save("hello.png")
+    # rendered_image, radii = rasterizer(means3D=means3D,means2D = means2D,shs = shs,colors_precomp = colors_precomp,opacities = opacity,scales = scales,rotations = rotations,cov3D_precomp = cov3D_precomp); Image.fromarray((rendered_image.permute(1,2,0).detach().cpu().numpy()*255.).astype(np.uint8)).save("hello.png")
+    hello2=rendered_image.permute(1,2,0).detach().cpu().clone()
+    tmp=hello2[:,:512].clone(); hello2[:,:512]=hello2[:,512:]; hello2[:,512:]=tmp
+    Image.fromarray((hello2.numpy()*255.).astype(np.uint8)).save("hello2.png")
+    import pdb; pdb.set_trace() #### For debugging / MUST remove after
+
 
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     # They will be excluded from value updates used in the splitting criteria.
     return {"render": rendered_image,
             "viewspace_points": screenspace_points,
             "visibility_filter" : radii > 0,
-            "radii": radii,
-            "depth": depth}
+            "radii": radii}

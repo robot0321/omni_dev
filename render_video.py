@@ -23,6 +23,7 @@ from gaussian_renderer import GaussianModel
 import numpy as np
 import matplotlib
 import imageio
+import time
 # def render_set(model_path, name, iteration, views, gaussians, pipeline, background):
 #     render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
 #     gts_path = os.path.join(model_path, name, "ours_{}".format(iteration), "gt")
@@ -57,6 +58,7 @@ def depth_colorize_with_mask(depthlist, background=(0,0,0), dmindmax=None):
 
 
 def render_set(model_path, iteration, views, gaussians, pipeline, background, preset):
+    cvt = time.time()
     preset = preset+'_skipalpha0.5_divacc'
     render_path = os.path.join(model_path, preset, "ours_{}".format(iteration), "renders")
     gts_path = os.path.join(model_path, preset, "ours_{}".format(iteration), "gt")
@@ -90,6 +92,7 @@ def render_set(model_path, iteration, views, gaussians, pipeline, background, pr
             framelist.append(np.round(rendering.permute(1,2,0).detach().cpu().numpy()*255.).astype(np.uint8))
     
     imageio.mimwrite(os.path.join(model_path, preset, "ours_{}".format(iteration), "video60_RGB.mp4"), framelist, fps=60, quality=8)
+    pvt = cvt; cvt = time.time(); print(f"Depth colorize time: {cvt-pvt:.4f}")
     # import pdb; pdb.set_trace()
     
     depthlist = np.concatenate(depthlist, axis=0)
@@ -112,6 +115,7 @@ def render_set(model_path, iteration, views, gaussians, pipeline, background, pr
                 framelist[idx] = np.concatenate((framelist[idx], np.round(colorized_depth[0]*255.).astype(np.uint8)), axis=1)
             
     imageio.mimwrite(os.path.join(model_path, preset, "ours_{}".format(iteration), "video_RGBD.mp4"), framelist, fps=60, quality=8)
+    pvt = cvt; cvt = time.time(); print(f"Depth render time: {cvt-pvt:.4f}")
 
 def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, preset : str):
     with torch.no_grad():

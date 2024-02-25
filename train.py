@@ -18,6 +18,7 @@ import sys
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state
 import uuid
+import time
 from tqdm import tqdm
 from utils.image_utils import psnr
 from lpipsPyTorch import lpips
@@ -225,8 +226,8 @@ if __name__ == "__main__":
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[0, 500, 1000, 2000, 3000, 4000, 7_000, 30_000])
-    parser.add_argument("--save_iterations", nargs="+", type=int, default=[1000, 2000, 3000, 4000, 7_000, 30_000])
+    parser.add_argument("--test_iterations", nargs="+", type=int, default=[3_000, 7_000, 30_000])
+    parser.add_argument("--save_iterations", nargs="+", type=int, default=[3_000, 7_000, 30_000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
@@ -240,7 +241,9 @@ if __name__ == "__main__":
     # Start GUI server, configure and run training
     network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
+    pvt = time.time()
     training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
+    print(f"Learning Gaussian {time.time()-pvt}")
 
     # All done
     print("\nTraining complete.")
