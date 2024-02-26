@@ -15,6 +15,7 @@ import math
 from diff_gaussian_omni_rasterization import GaussianRasterizationSettings, GaussianRasterizer
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
+from render import depth_colorize_with_mask
 
 def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None):
     """
@@ -88,7 +89,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     opacity[:]=1. #### For debugging / MUST remove after
     scales[:]=10. #### For debugging / MUST remove after
     
-    rendered_image, radii = rasterizer(
+    rendered_image, depth, acc, radii = rasterizer(
         means3D = means3D,
         means2D = means2D,
         shs = shs,
@@ -100,7 +101,9 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         
     from PIL import Image; import numpy as np
     Image.fromarray((rendered_image.permute(1,2,0).detach().cpu().numpy()*255.).astype(np.uint8)).save("hello.png")
-    # rendered_image, radii = rasterizer(means3D=means3D,means2D = means2D,shs = shs,colors_precomp = colors_precomp,opacities = opacity,scales = scales,rotations = rotations,cov3D_precomp = cov3D_precomp); Image.fromarray((rendered_image.permute(1,2,0).detach().cpu().numpy()*255.).astype(np.uint8)).save("hello.png")
+    Image.fromarray((depth_colorize_with_mask(depth.detach().cpu().numpy())*255.).astype(np.uint8)).save("hello_depth.png")
+    Image.fromarray((acc.detach().cpu().numpy()*255.).astype(np.uint8)).save("hello_acc.png")
+    # rendered_image, depth, acc, radii = rasterizer(means3D=means3D,means2D = means2D,shs = shs,colors_precomp = colors_precomp,opacities = opacity,scales = scales,rotations = rotations,cov3D_precomp = cov3D_precomp); Image.fromarray((rendered_image.permute(1,2,0).detach().cpu().numpy()*255.).astype(np.uint8)).save("hello.png"); Image.fromarray((depth.detach().cpu().numpy()/depth.max().item()*255.).astype(np.uint8)).save("hello_depth.png"); Image.fromarray((acc.detach().cpu().numpy()*255.).astype(np.uint8)).save("hello_acc.png")
     hello2=rendered_image.permute(1,2,0).detach().cpu().clone()
     tmp=hello2[:,:512].clone(); hello2[:,:512]=hello2[:,512:]; hello2[:,512:]=tmp
     Image.fromarray((hello2.numpy()*255.).astype(np.uint8)).save("hello2.png")

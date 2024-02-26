@@ -40,6 +40,11 @@ cmapper = matplotlib.cm.get_cmap('jet_r')
 
 def depth_colorize_with_mask(depthlist, background=(0,0,0), dmindmax=None):
     """ depth: (H,W) - [0 ~ 1] / mask: (H,W) - [0 or 1]  -> colorized depth (H,W,3) [0 ~ 1] """
+    single_batch = True if len(depthlist.shape)==2 else False
+        
+    if single_batch:
+        depthlist = depthlist[None]
+    
     batch, vx, vy = np.where(depthlist!=0)
     if dmindmax is None:
         valid_depth = depthlist[batch, vx, vy]
@@ -53,7 +58,7 @@ def depth_colorize_with_mask(depthlist, background=(0,0,0), dmindmax=None):
     final_depth = np.ones(depthlist.shape + (3,)) * np.array(background).reshape(1,1,1,3) # [B, H, W, 3]
     final_depth[batch, vx, vy] = cmapper(norm_dth)[batch,vx,vy,:3]
 
-    return final_depth
+    return final_depth[0] if single_batch else final_depth
 
 
 def render_set(model_path, name, iteration, views, gaussians, pipeline, background):

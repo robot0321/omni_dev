@@ -100,6 +100,12 @@ __device__ float3 computeOmniCov2D(const float3& mean, float focal_x, float foca
 		-mu.x*t.y/deno, (mu.x*t.x + mu.z*t.z)/deno, -mu.z*t.y/deno,
 		-mu.x*t.z/deno, -mu.y*t.z/deno, (mu.x*t.x + mu.y*t.y)/deno);
 
+	// float deno = 1; //pow(mu.x*mu.x + mu.y*mu.y + mu.z*mu.z, 1.5)+0.0000001f;
+	// glm::mat3 J = glm::mat3(
+	// 	(mu.y*mu.y + mu.z*mu.z)/deno, -mu.y*mu.x/deno, -mu.z*mu.x/deno,
+	// 	-mu.x*mu.y/deno, (mu.x*mu.x + mu.z*mu.z)/deno, -mu.z*mu.y/deno,
+	// 	-mu.x*mu.z/deno, -mu.y*mu.z/deno, (mu.x*mu.x + mu.y*mu.y)/deno);
+
 	glm::mat3 W = glm::mat3(
 		viewmatrix[0], viewmatrix[4], viewmatrix[8],
 		viewmatrix[1], viewmatrix[5], viewmatrix[9],
@@ -334,11 +340,14 @@ renderCUDA(
 	int W, int H,
 	const float2* __restrict__ points_xy_image,
 	const float* __restrict__ features,
+	const float* __restrict__ depths,
 	const float4* __restrict__ conic_opacity,
 	float* __restrict__ final_T,
 	uint32_t* __restrict__ n_contrib,
 	const float* __restrict__ bg_color,
-	float* __restrict__ out_color)
+	float* __restrict__ out_color,
+    float* __restrict__ out_depth,
+    float* __restrict__ out_acc)
 {
 	// Identify current tile and associated min/max pixel range.
 	auto block = cg::this_thread_block();
@@ -369,6 +378,8 @@ renderCUDA(
 	uint32_t contributor = 0;
 	uint32_t last_contributor = 0;
 	float C[CHANNELS] = { 0 };
+	float D = { 0 };
+    float A = { 0 };
 
 	// Iterate over batches until all done or range is complete
 	for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE)
@@ -421,7 +432,8 @@ renderCUDA(
 			// Eq. (3) from 3D Gaussian splatting paper.
 			for (int ch = 0; ch < CHANNELS; ch++)
 				C[ch] += features[collected_id[j] * CHANNELS + ch] * alpha * T;
-
+            D += depths[collected_id[j]] * alpha * T;
+			A += alpha * T;
 			T = test_T;
 
 			// Keep track of last range entry to update this
@@ -438,6 +450,9 @@ renderCUDA(
 		n_contrib[pix_id] = last_contributor;
 		for (int ch = 0; ch < CHANNELS; ch++)
 			out_color[ch * H * W + pix_id] = C[ch] + T * bg_color[ch];
+		A += 1e-8;
+        out_depth[pix_id]= D/A;
+        out_acc[pix_id] = A;
 	}
 }
 
@@ -448,11 +463,14 @@ void FORWARD::render(
 	int W, int H,
 	const float2* means2D,
 	const float* colors,
+	const float* depths,
 	const float4* conic_opacity,
 	float* final_T,
 	uint32_t* n_contrib,
 	const float* bg_color,
-	float* out_color)
+	float* out_color,
+    float* out_depth,
+    float* out_acc)
 {
 	renderCUDA<NUM_CHANNELS> << <grid, block >> > (
 		ranges,
@@ -460,11 +478,14 @@ void FORWARD::render(
 		W, H,
 		means2D,
 		colors,
+		depths,
 		conic_opacity,
 		final_T,
 		n_contrib,
 		bg_color,
-		out_color);
+		out_color,
+		out_depth,
+		out_acc);
 }
 
 void FORWARD::preprocess(int P, int D, int M,
