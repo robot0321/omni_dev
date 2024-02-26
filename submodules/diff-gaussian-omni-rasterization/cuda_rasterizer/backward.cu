@@ -149,7 +149,6 @@ __global__ void computeCov2DCUDA(int P,
 	const float tan_fovx, float tan_fovy,
 	const float* view_matrix,
 	const float* dL_dconics,
-	const float* dL_ddepths,
 	float3* dL_dmeans,
 	float* dL_dcov)
 {
@@ -264,7 +263,6 @@ __global__ void computeCov2DCUDA(int P,
 	float dL_dty = y_grad_mul * -h_y * tz2 * dL_dJ12;
 	float dL_dtz = -h_x * tz2 * dL_dJ00 - h_y * tz2 * dL_dJ11 + (2 * h_x * t.x) * tz3 * dL_dJ02 + (2 * h_y * t.y) * tz3 * dL_dJ12;
 
-	dL_dtz += dL_ddepths[idx];
 	// Account for transformation of mean to t
 	// t = transformPoint4x3(mean, view_matrix);
 	float3 dL_dmean = transformVec4x3Transpose({ dL_dtx, dL_dty, dL_dtz }, view_matrix);
@@ -408,19 +406,13 @@ renderCUDA(
 	const float2* __restrict__ points_xy_image,
 	const float4* __restrict__ conic_opacity,
 	const float* __restrict__ colors,
-    const float* __restrict__ depths,
 	const float* __restrict__ final_Ts,
-    const float* __restrict__ final_As,
-    const float* __restrict__ final_Ds,
 	const uint32_t* __restrict__ n_contrib,
 	const float* __restrict__ dL_dpixels,
-    const float* __restrict__ dL_dDs,
 	float3* __restrict__ dL_dmean2D,
 	float4* __restrict__ dL_dconic2D,
 	float* __restrict__ dL_dopacity,
-	float* __restrict__ dL_dcolors,
-    float* __restrict__ dL_ddepths
-    )
+	float* __restrict__ dL_dcolors)
 {
 	// We rasterize again. Compute necessary block info.
 	auto block = cg::this_thread_block();
@@ -443,15 +435,11 @@ renderCUDA(
 	__shared__ float2 collected_xy[BLOCK_SIZE];
 	__shared__ float4 collected_conic_opacity[BLOCK_SIZE];
 	__shared__ float collected_colors[C * BLOCK_SIZE];
-	__shared__ float collected_depths[BLOCK_SIZE];
 
 	// In the forward, we stored the final value for T, the
 	// product of all (1 - alpha) factors. 
 	const float T_final = inside ? final_Ts[pix_id] : 0;
 	float T = T_final;
-
-    const float Acc = inside ? final_As[pix_id] : 0;
-    const float Dep = inside ? final_Ds[pix_id] : 0;
 
 	// We start from the back. The ID of the last contributing
 	// Gaussian is known from each pixel from the forward.
@@ -459,20 +447,13 @@ renderCUDA(
 	const int last_contributor = inside ? n_contrib[pix_id] : 0;
 
 	float accum_rec[C] = { 0 };
-	float dL_dpixel[C];    
-	float dL_dD;
-    float accum_dep = 0;
-	float accum_acc = 0;
+	float dL_dpixel[C];
 	if (inside)
-	{
-		dL_dD = dL_dDs[pix_id];
 		for (int i = 0; i < C; i++)
 			dL_dpixel[i] = dL_dpixels[i * H * W + pix_id];
-	}   
 
 	float last_alpha = 0;
 	float last_color[C] = { 0 };
-    float last_depth = 0;
 
 	// Gradient of pixel coordinate w.r.t. normalized 
 	// screen-space viewport corrdinates (-1 to 1)
@@ -492,7 +473,6 @@ renderCUDA(
 			collected_id[block.thread_rank()] = coll_id;
 			collected_xy[block.thread_rank()] = points_xy_image[coll_id];
 			collected_conic_opacity[block.thread_rank()] = conic_opacity[coll_id];
-			collected_depths[block.thread_rank()] = depths[coll_id];
 			for (int i = 0; i < C; i++)
 				collected_colors[i * BLOCK_SIZE + block.thread_rank()] = colors[coll_id * C + i];
 		}
@@ -522,15 +502,12 @@ renderCUDA(
 
 			T = T / (1.f - alpha);
 			const float dchannel_dcolor = alpha * T;
-			const float dD_ddepth = alpha*T/Acc;
 
 			// Propagate gradients to per-Gaussian colors and keep
 			// gradients w.r.t. alpha (blending factor for a Gaussian/pixel
 			// pair).
 			float dL_dalpha = 0.0f;
 			const int global_id = collected_id[j];
-			//Partial derivative of depth loss with respect to each Gaussian depth
-            atomicAdd(&(dL_ddepths[global_id]), dD_ddepth * dL_dD);
 			for (int ch = 0; ch < C; ch++)
 			{
 				const float c = collected_colors[ch * BLOCK_SIZE + j];
@@ -545,18 +522,7 @@ renderCUDA(
 				// many that were affected by this Gaussian.
 				atomicAdd(&(dL_dcolors[global_id * C + ch]), dchannel_dcolor * dL_dchannel);
 			}
-
-            //+dW_dalpha
-			const float dD_dW = -Dep/Acc;
-			accum_acc = last_alpha + (1.f - last_alpha) * accum_acc;
-			dL_dalpha += (1.f - accum_acc) * dL_dD * dD_dW;
-
-            //+dsum_dalpha
-			accum_dep = last_alpha * last_depth + (1.f - last_alpha) * accum_dep;
-			last_depth = collected_depths[j];
-			dL_dalpha += (collected_depths[j] - accum_dep) * (dL_dD / Acc);
 			dL_dalpha *= T;
-
 			// Update last alpha (to be used in the next iteration)
 			last_alpha = alpha;
 
@@ -609,7 +575,6 @@ void BACKWARD::preprocess(
 	const float* dL_dconic,
 	glm::vec3* dL_dmean3D,
 	float* dL_dcolor,
-	float* dL_ddepths,
 	float* dL_dcov3D,
 	float* dL_dsh,
 	glm::vec3* dL_dscale,
@@ -630,7 +595,6 @@ void BACKWARD::preprocess(
 		tan_fovy,
 		viewmatrix,
 		dL_dconic,
-		dL_ddepths,
 		(float3*)dL_dmean3D,
 		dL_dcov3D);
 
@@ -666,19 +630,13 @@ void BACKWARD::render(
 	const float2* means2D,
 	const float4* conic_opacity,
 	const float* colors,
-    const float* depths,
 	const float* final_Ts,
-    const float* final_As,
-    const float* final_Ds,
 	const uint32_t* n_contrib,
 	const float* dL_dpixels,
-    const float* dL_dDs,
 	float3* dL_dmean2D,
 	float4* dL_dconic2D,
 	float* dL_dopacity,
-	float* dL_dcolors,
-    float* dL_ddepths
-    )
+	float* dL_dcolors)
 {
 	renderCUDA<NUM_CHANNELS> << <grid, block >> >(
 		ranges,
@@ -688,17 +646,12 @@ void BACKWARD::render(
 		means2D,
 		conic_opacity,
 		colors,
-        depths,
 		final_Ts,
-        final_As,
-        final_Ds,
 		n_contrib,
 		dL_dpixels,
-        dL_dDs,
 		dL_dmean2D,
 		dL_dconic2D,
 		dL_dopacity,
-		dL_dcolors,
-        dL_ddepths
+		dL_dcolors
 		);
 }

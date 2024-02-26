@@ -9,13 +9,37 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
+import numpy as np
+import matplotlib
 import torch
 import math
 # from depth_diff_gaussian_rasterization_min import GaussianRasterizationSettings, GaussianRasterizer
 from diff_gaussian_omni_rasterization import GaussianRasterizationSettings, GaussianRasterizer
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
-from render import depth_colorize_with_mask
+
+cmapper = matplotlib.cm.get_cmap('jet_r')
+def depth_colorize_with_mask(depthlist, background=(0,0,0), dmindmax=None):
+    """ depth: (H,W) - [0 ~ 1] / mask: (H,W) - [0 or 1]  -> colorized depth (H,W,3) [0 ~ 1] """
+    single_batch = True if len(depthlist.shape)==2 else False
+        
+    if single_batch:
+        depthlist = depthlist[None]
+    
+    batch, vx, vy = np.where(depthlist!=0)
+    if dmindmax is None:
+        valid_depth = depthlist[batch, vx, vy]
+        dmin, dmax = valid_depth.min(), valid_depth.max()
+    else:
+        dmin, dmax = dmindmax
+    
+    norm_dth = np.ones_like(depthlist)*dmax # [B, H, W]
+    norm_dth[batch, vx, vy] = (depthlist[batch, vx, vy]-dmin)/(dmax-dmin)
+    
+    final_depth = np.ones(depthlist.shape + (3,)) * np.array(background).reshape(1,1,1,3) # [B, H, W, 3]
+    final_depth[batch, vx, vy] = cmapper(norm_dth)[batch,vx,vy,:3]
+
+    return final_depth[0] if single_batch else final_depth
 
 def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None):
     """
